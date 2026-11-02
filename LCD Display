@@ -1,0 +1,106 @@
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- HARDWARE PINS ---
+const int FAN_RELAY = 12;   // D6 
+const int LIGHT_RELAY = 14; // D5 
+const int RED_LED = 13;     // D7 
+const int YELLOW_LED = 16;  // D0 
+
+bool lightState = false;
+bool fanState = false;
+
+typedef struct struct_message {
+  char text[32];
+} struct_message;
+struct_message myData;
+
+unsigned long lcdTimer = 0;
+bool lcdCustomActive = false;
+
+void showLCDMessage(String line1, String line2 = "") {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  if (line2 != "") {
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+  }
+  lcdTimer = millis();
+  lcdCustomActive = true;
+}
+
+void executeCommand(String command) {
+  command.trim();
+  
+  // Flash Red LED to confirm command received
+  digitalWrite(RED_LED, HIGH);
+  delay(100);
+  digitalWrite(RED_LED, LOW);
+
+  if (command == "TOGGLE_LIGHT") {
+    lightState = !lightState;
+    digitalWrite(LIGHT_RELAY, lightState ? LOW : HIGH);
+    showLCDMessage(lightState ? "Light: ON" : "Light: OFF");
+  } 
+  else if (command == "TOGGLE_FAN") {
+    fanState = !fanState;
+    digitalWrite(FAN_RELAY, fanState ? LOW : HIGH); 
+    showLCDMessage(fanState ? "Fan: ON" : "Fan: OFF");
+  } 
+  else if (command.startsWith("TEXT:")) {
+    showLCDMessage(command.substring(5)); // Displays Mode changes and Sign Language
+  }
+}
+
+// ESP-NOW Receive Callback
+void OnDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len) {
+  memcpy(&myData, incomingData, sizeof(myData));
+  executeCommand(String(myData.text));
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize relays to OFF
+  digitalWrite(FAN_RELAY, HIGH);
+  digitalWrite(LIGHT_RELAY, HIGH);
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(LIGHT_RELAY, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+
+  // Initialize LCD
+  Wire.begin(4, 5); 
+  lcd.init();
+  lcd.backlight();
+  showLCDMessage("WAVE CONTROL", "ESP-NOW Ready");
+
+  // Initialize ESP-NOW
+  WiFi.mode(WIFI_STA);
+  wifi_set_channel(1); 
+  WiFi.disconnect();
+
+  if (esp_now_init() != 0) return;
+  
+  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+  esp_now_register_recv_cb(OnDataRecv);
+  
+  digitalWrite(YELLOW_LED, HIGH); // System active
+}
+
+void loop() {
+  // Clear LCD to standby after 10 seconds
+  if (lcdCustomActive && (millis() - lcdTimer > 10000)) {
+    lcdCustomActive = false;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WAVE CONTROL");
+    lcd.setCursor(0, 1);
+    lcd.print("Awaiting Gesture");
+  }
+}
