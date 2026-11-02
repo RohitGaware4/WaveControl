@@ -1,0 +1,150 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// --- ESP-NOW CONFIGURATION ---
+uint8_t receiverAddress[] = {0x48, 0x3F, 0xDA, 0x4A, 0xA0, 0x96}; 
+
+typedef struct struct_message {
+  char text[32];
+} struct_message;
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
+// --- HARDWARE PINS ---
+const int F1_PIN = 34; // Thumb
+const int F2_PIN = 35; // Index
+const int F3_PIN = 32; // Middle
+const int F4_PIN = 33; // Ring
+const int F5_PIN = 36; // Pinky (Ignored for gestures)
+
+// --- CALIBRATION THRESHOLDS ---
+int T_F1 = 1200; 
+int T_F2 = 1250;
+int T_F3 = 800;
+int T_F4 = 800;
+int T_F5 = 800; 
+
+// --- STATE TRACKING & TIMERS ---
+int currentMode = 1; // 1 = Sign Lang, 0 = Home Auto
+bool latchUnlocked = true; 
+unsigned long lastPrintTime = 0;
+
+// NEW: Gesture Stability Timers
+int pendingGesture = -1;
+unsigned long gestureTimer = 0;
+const int HOLD_TIME = 400; // Requires gesture to be held stable for 400ms
+
+void sendCommand(const char* payload) {
+  strcpy(myData.text, payload);
+  esp_now_send(receiverAddress, (uint8_t *) &myData, sizeof(myData));
+  Serial.printf("\n>>> [ESP-NOW] SENT: %s <<<\n\n", payload);
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+  setCpuFrequencyMhz(80);
+
+  Serial.begin(115200);
+  analogReadResolution(12);
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) return;
+  
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 1;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+  
+  Serial.println("\n--- GLOVE LIVE DIAGNOSTIC MODE ---");
+}
+
+void loop() {
+  int val1 = analogRead(F1_PIN);
+  int val2 = analogRead(F2_PIN);
+  int val3 = analogRead(F3_PIN);
+  int val4 = analogRead(F4_PIN);
+  int val5 = analogRead(F5_PIN); 
+
+  bool f1 = val1 > T_F1;
+  bool f2 = val2 > T_F2;
+  bool f3 = val3 > T_F3;
+  bool f4 = val4 > T_F4;
+  bool f5 = val5 > T_F5;
+
+  if (millis() - lastPrintTime > 500) {
+    Serial.printf("RAW DATA -> F1:%-4d | F2:%-4d | F3:%-4d | F4:%-4d | F5:%-4d (Ignored)\n", val1, val2, val3, val4, val5);
+    Serial.printf("IS BENT? -> F1:%-4s | F2:%-4s | F3:%-4s | F4:%-4s | F5:%-4s   [Latch: %s]\n", 
+                  f1?"NO":"YES", f2?"NO":"YES", f3?"NO":"YES", f4?"NO":"YES", f5?"NO":"YES", 
+                  latchUnlocked ? "UNLOCKED" : "LOCKED");
+    Serial.printf("CURRENT MODE: %s\n", currentMode == 1 ? "SIGN LANGUAGE" : "HOME AUTOMATION");
+    Serial.println("-------------------------------------------------------------------------");
+    lastPrintTime = millis();
+  }
+
+  // 1. UNLOCKING LOGIC (Requires hand to be flat)
+  if (f1 && f2 && f3 && f4) {
+    latchUnlocked = true; 
+  }
+
+  // 2. READ CURRENT GESTURE SHAPE
+  int currentGesture = -1;
+  if      (!f1 && !f2 && !f3 && !f4) currentGesture = 0; // Mode Switch
+  else if ( f1 && !f2 && !f3 && !f4) currentGesture = 1; // F1: Water
+  else if (!f1 &&  f2 && !f3 && !f4) currentGesture = 2; // F2: No / Light Toggle
+  else if ( f1 &&  f2 && !f3 && !f4) currentGesture = 3; // F1+F2: Yes
+  else if (!f1 && !f2 && !f3 &&  f4) currentGesture = 4; // F4: Washroom
+  else if (!f1 &&  f2 &&  f3 && !f4) currentGesture = 5; // F2+F3: Thank You / Fan Toggle
+  else if (!f1 &&  f2 &&  f3 &&  f4) currentGesture = 6; // EMG: F1 bent, F2+F3+F4 straight
+  
+  // 3. GESTURE STABILITY CHECK
+  if (currentGesture != -1 && latchUnlocked) {
+    
+    // If the gesture hasn't changed, check if we've held it long enough
+    if (currentGesture == pendingGesture) {
+      if (millis() - gestureTimer > HOLD_TIME) {
+        
+        // --- EXECUTE VERIFIED COMMAND ---
+        if (currentGesture == 0) {
+          currentMode = !currentMode;
+          if (currentMode == 1) sendCommand("TEXT:Sign Lang Mode");
+          else sendCommand("TEXT:Home Auto Mode");
+        } 
+        else if (currentMode == 1) { 
+          switch (currentGesture) {
+            case 1: sendCommand("TEXT:WATER"); break;
+            case 2: sendCommand("TEXT:NO"); break;
+            case 3: sendCommand("TEXT:YES"); break;
+            case 4: sendCommand("TEXT:WASHROOM"); break;
+            case 5: sendCommand("TEXT:THANK YOU"); break;
+            case 6: sendCommand("TEXT:EMERGENCY"); break;
+          }
+        } 
+        else if (currentMode == 0) { 
+          switch (currentGesture) {
+            case 2: sendCommand("TOGGLE_LIGHT"); break;
+            case 5: sendCommand("TOGGLE_FAN"); break;
+            case 6: sendCommand("TEXT:EMERGENCY"); break;
+          }
+        }
+        
+        latchUnlocked = false; // Lock the system so it only sends once
+      }
+    } 
+    // If the gesture is changing (fingers still moving), reset the timer
+    else {
+      pendingGesture = currentGesture;
+      gestureTimer = millis();
+    }
+  } 
+  // If no valid gesture is detected, reset everything
+  else {
+    pendingGesture = -1;
+  }
+  
+  delay(50);
+}
