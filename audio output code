@@ -1,0 +1,119 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h> // FIX 1: Required for setting the Wi-Fi channel
+#include <SD.h>
+#include <SPI.h>
+#include "BluetoothA2DPSource.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioFileSourceSD.h"
+#include "AudioOutputI2SNoDAC.h"
+
+// --- BLUETOOTH CONFIGURATION ---
+BluetoothA2DPSource a2dp_source;
+const char* SPEAKER_NAME = "M412SP"; // Must match exactly
+
+// --- SD CARD PINS (ESP32-CAM) ---
+#define SD_SCK  14
+#define SD_MISO 2
+#define SD_MOSI 15
+#define SD_CS   13
+
+AudioGeneratorMP3 *mp3;
+AudioFileSourceSD *file;
+AudioOutputI2SNoDAC *out;
+
+// --- ESP-NOW CONFIGURATION ---
+typedef struct struct_message {
+  char text[32];
+} struct_message;
+struct_message myData;
+
+bool shouldPlayAudio = false;
+String audioFileToPlay = "";
+
+// FIX 2: Updated callback format for ESP32 Core Version 3.x
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  memcpy(&myData, incomingData, sizeof(myData));
+  String command = String(myData.text);
+  Serial.println("Received: " + command);
+
+ if (command == "TEXT:WATER") {
+    audioFileToPlay = "/water.mp3";
+    shouldPlayAudio = true;
+  } 
+  else if (command == "TEXT:EMERGENCY") {
+    audioFileToPlay = "/emg.mp3";
+    shouldPlayAudio = true;
+  }
+  else if (command == "TEXT:NO") {
+    audioFileToPlay = "/NO.mp3";
+    shouldPlayAudio = true;
+  }
+  else if (command == "TEXT:YES") {
+    audioFileToPlay = "/Yes.mp3";
+    shouldPlayAudio = true;
+  }
+  else if (command == "TEXT:WASHROOM") {
+    audioFileToPlay = "/washroom.mp3";
+    shouldPlayAudio = true;
+  }
+  else if (command == "TEXT:MEDICINE") {
+    audioFileToPlay = "/medicine.mp3";
+    shouldPlayAudio = true;
+  }
+}
+
+// Audio Data Callback for Bluetooth
+int32_t get_audio_data(Frame *channels, int32_t frame_count) {
+    if (mp3 && mp3->isRunning()) {
+        return frame_count; 
+    }
+    return 0; 
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize SD Card
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SPI, 4000000)) {
+    Serial.println("SD Card Failed");
+    return;
+  }
+
+  // Initialize Audio Components
+  out = new AudioOutputI2SNoDAC();
+  mp3 = new AudioGeneratorMP3();
+
+  // Initialize ESP-NOW
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(OnDataRecv);
+  }
+
+  // Start Bluetooth A2DP Source
+  Serial.println("Starting Bluetooth...");
+  a2dp_source.start(SPEAKER_NAME, get_audio_data);  
+  Serial.println("System Ready.");
+}
+
+void loop() {
+  // Trigger file loading outside of the ESP-NOW interrupt
+  if (shouldPlayAudio) {
+    if (mp3->isRunning()) mp3->stop();
+    if (file) delete file;
+    
+    file = new AudioFileSourceSD(audioFileToPlay.c_str());
+    mp3->begin(file, out);
+    shouldPlayAudio = false;
+    Serial.println("Playing over Bluetooth: " + audioFileToPlay);
+  }
+
+  // Keep MP3 decoder running
+  if (mp3 && mp3->isRunning()) {
+    if (!mp3->loop()) {
+      mp3->stop();
+    }
+  }
+}
